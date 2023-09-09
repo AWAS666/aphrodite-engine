@@ -32,7 +32,9 @@ from aphrodite.modeling.layers.activation import get_act_fn
 from aphrodite.modeling.layers.attention import PagedAttentionWithRoPE
 from aphrodite.modeling.layers.sampler import Sampler
 from aphrodite.modeling.hf_downloader import (hf_model_weights_iterator,
-                                              load_tensor_parallel_weights)
+                                              load_tensor_parallel_weights,
+                                              preprocess_quant_weight,
+                                              update_parallel_weight_names)
 from aphrodite.modeling.megatron.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from aphrodite.modeling.megatron.tensor_parallel import (
@@ -225,7 +227,8 @@ class GPTNeoXForCausalLM(nn.Module):
 
     _column_parallel_weights = [
         "embed_in.weight", "embed_out.weight", "dense_h_to_4h.weight",
-        "dense_h_to_4h.bias"
+        "dense_h_to_4h.bias", "dense_h_to_4h.qweight", "dense_h_to_4h.scales",
+        "dense_h_to_4h.qzeros"
     ]
     _row_parallel_weights = ["dense.weight", "dense_4h_to_h.weight"]
 
@@ -233,20 +236,32 @@ class GPTNeoXForCausalLM(nn.Module):
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto"):
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
         tensor_model_parallel_rank = get_tensor_model_parallel_rank()
+        (self._row_parallel_weights,
+         self._column_parallel_weights) = update_parallel_weight_names(
+             self.quantize_config,
+             self._row_parallel_weights,
+             self._column_parallel_weights)
         state_dict = self.state_dict()
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format):
             if ("attention.bias" in name or "attention.masked_bias" in name
                     or "rotary_emb.inv_freq" in name):
                 continue
+            loaded_weight = preprocess_quant_weight(self.quantize_config,
+                                                    name, loaded_weight,
+                                                    self._row_parallel_weights,
+                                                    tensor_model_parallel_rank)
             param = state_dict[name]
             if "query_key_value" in name:
                 # NOTE: GPT-NeoX's fused QKV has the shape of
                 # [num_heads * 3 * head_size, hidden_size], while the
                 # required shape is [3 * num_heads * head_size, hidden_size].
                 # Thus, we need weight conversion.
-                shard_size = param.shape[0]
+                shard_size = param.shape[1] if any(
+                    key in name for key in ("qweight", "qzeros",
+                                            "scales")) else param.shape[0]
                 loaded_weight = loaded_weight[
                     shard_size * tensor_model_parallel_rank:shard_size *
                     (tensor_model_parallel_rank + 1)]
@@ -254,11 +269,17 @@ class GPTNeoXForCausalLM(nn.Module):
                 num_heads = self.config.num_attention_heads
                 hidden_size = self.config.hidden_size
                 head_size = hidden_size // num_heads
-                if "query_key_value.weight" in name:
+                last_dim_size = loaded_weight.shape[-1]
+                if any(key in name for key in ("query_key_value.weight",
+                                               "query_key_value.qweight",
+                                               "query_key_value.qzeros",
+                                               "query_key_value.scales")):
+                    if "qzeros" in name:
+                        head_size = head_size // 32 * self.quantize.bits
                     loaded_weight = loaded_weight.view(-1, 3, head_size,
-                                                       hidden_size)
+                                                       last_dim_size)
                     loaded_weight = loaded_weight.transpose(0, 1)
-                    loaded_weight = loaded_weight.reshape(-1, hidden_size)
+                    loaded_weight = loaded_weight.reshape(-1, last_dim_size)
                 elif "query_key_value.bias" in name:
                     loaded_weight = loaded_weight.view(-1, 3, head_size)
                     loaded_weight = loaded_weight.transpose(0, 1)

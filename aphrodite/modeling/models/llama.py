@@ -36,9 +36,17 @@ from aphrodite.modeling.layers.activation import SiluAndMul
 from aphrodite.modeling.layers.layernorm import RMSNorm
 from aphrodite.modeling.layers.attention import PagedAttentionWithRoPE
 from aphrodite.modeling.layers.sampler import Sampler
-from aphrodite.modeling.hf_downloader import load_tensor_parallel_weights, load_padded_tensor_parallel_vocab, hf_model_weights_iterator
-from aphrodite.modeling.megatron.parallel_state import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
-from aphrodite.modeling.megatron.tensor_parallel import VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear
+from aphrodite.modeling.hf_downloader import (load_tensor_parallel_weights,
+                                              load_padded_tensor_parallel_vocab,
+                                              hf_model_weights_iterator,
+                                              preprocess_quant_weight,
+                                              update_parallel_weight_names)
+from aphrodite.modeling.megatron.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size)
+from aphrodite.modeling.megatron.tensor_parallel import (VocabParallelEmbedding,
+                                                         ColumnParallelLinear,
+                                                         RowParallelLinear)
 from aphrodite.common.sequence import SamplerOutput
 
 
@@ -275,6 +283,10 @@ class LlamaForCausalLM(nn.Module):
         kv_proj_shard_size = (self.config.hidden_size //
                               self.config.num_attention_heads *
                               self.config.num_key_value_heads // tp_size)
+        (self._row_parallel_weights,
+         self._column_parallel_weights) = update_parallel_weight_names(
+             self.quantize_config, self._row_parallel_weights,
+             self._column_parallel_weights)
         attention_weight_specs = [
             # (weight_name, shard_size, offset)
             ("q_proj", q_proj_shard_size, 0),
@@ -289,11 +301,24 @@ class LlamaForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            loaded_weight = preprocess_quant_weight(self.quantize_config, name,
+                                                    loaded_weight,
+                                                    self._row_parallel_weights,
+                                                    tp_size)
+
             is_attention_weight = False
             for weight_name, shard_size, offset in attention_weight_specs:
                 if weight_name not in name:
                     continue
+                if "g_idx" in name:
+                    name = name.replace(weight_name, "qkv_proj")
+                    break
                 param = state_dict[name.replace(weight_name, "qkv_proj")]
+                if any(key in name for key in ("qweight", "qzeros", "scales")):
+                    param = param.T
+                if "qzeros" in name:
+                    shard_size = shard_size // 32 * self.quantize_config.bits
+                    offset = offset // 32 * self.quantize_config.bits
 
                 loaded_weight = loaded_weight[
                     shard_size * tensor_model_parallel_rank:shard_size *
@@ -311,7 +336,12 @@ class LlamaForCausalLM(nn.Module):
             for stride_id, weight_name in enumerate(["gate_proj", "up_proj"]):
                 if weight_name not in name:
                     continue
+                if "g_idx" in name:
+                    name = name.replace(weight_name, "gate_up_proj")
+                    break
                 param = state_dict[name.replace(weight_name, "gate_up_proj")]
+                if any(key in name for key in ("qweight", "qzeros", "scales")):
+                    param = param.T
                 shard_size = param.shape[0] // 2
                 loaded_weight = loaded_weight[
                     shard_size * tensor_model_parallel_rank:shard_size *

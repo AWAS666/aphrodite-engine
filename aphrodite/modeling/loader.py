@@ -7,6 +7,7 @@ from transformers import PretrainedConfig
 from aphrodite.common.config import ModelConfig
 from aphrodite.modeling.models import LlamaForCausalLM, GPTJForCausalLM, GPTNeoXForCausalLM
 from aphrodite.modeling.hf_downloader import initialize_dummy_weights
+from aphrodite.modeling.quantize import TpGPTQQuantizer, patch_tp_linear_layer
 
 _MODEL_REGISTRY = {
     "LlamaForCausalLM": LlamaForCausalLM,
@@ -34,12 +35,21 @@ def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
         f"Supported architectures: {list(_MODEL_REGISTRY.keys())}")
 
 
-def get_model(model_config: ModelConfig) -> nn.Module:
+def get_model(model_config: ModelConfig, max_tokens: int) -> nn.Module:
     model_class = _get_model_architecture(model_config.hf_config)
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
         # The weights will be initialized as empty tensors.
-        model = model_class(model_config.hf_config)
+        if model_config.quantize_config is not None:
+            quantizer = TpGPTQQuantizer.from_dict(
+                model_config.quantize_config.to_dict())
+            patch_tp_linear_layer()
+            model = model_class(model_config.hf_config)
+            model = quantizer.convert_model(model)
+        else:
+            model = model_class(model_config.hf_config)
+            model.quantize_config = model_config.quantize_config
+
         if model_config.load_format == "dummy":
             model = model.cuda()
             # NOTE: For accurate performance evaluation, we assign
@@ -50,4 +60,6 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format)
             model = model.cuda()
+        if model_config.quantize_config is not None:
+            model = quantizer.post_init_model(model, max_tokens)
     return model.eval()
