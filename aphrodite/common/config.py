@@ -2,7 +2,10 @@ from typing import Optional
 
 import torch
 from transformers import PretrainedConfig
-
+from transformers.utils import (
+    is_auto_gptq_available,
+    is_optimum_available,
+)
 from aphrodite.common.logger import init_logger
 from aphrodite.transformers_utils.config import get_config
 from aphrodite.common.utils import get_cpu_memory
@@ -58,6 +61,7 @@ class ModelConfig:
         self.download_dir = download_dir
         self.load_format = load_format
         self.seed = seed
+        self.quantize_config = None
 
         self.hf_config = get_config(model, trust_remote_code)
         self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
@@ -81,6 +85,18 @@ class ModelConfig:
                 f"Unknown tokenizer mode: {self.tokenizer_mode}. Must be "
                 "either 'auto' or 'slow'.")
         self.tokenizer_mode = tokenizer_mode
+
+    def _check_quantize_config(self) -> None:
+        if hasattr(self.hf_config, "quantization_config"
+                   ) and self.hf_config.quantization_config.get(
+                       "quant_method") == QuantizationMethod.GPTQ:
+            if not (is_optimum_available() and is_auto_gptq_available()):
+                raise ImportError(
+                    "Loading GPTQ quantized model requires optimum and AutoGPTQ libraries: "
+                    "`pip install optimum auto-gptq`")
+            self.quantize_config = GPTQConfig.from_dict(
+                self.hf_config.quantization_config)
+            self.dtype = torch.float16
 
     def verify_with_parallel_config(
         self,
