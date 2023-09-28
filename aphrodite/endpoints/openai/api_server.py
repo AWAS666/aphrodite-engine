@@ -226,7 +226,6 @@ async def create_chat_completion(request: ChatCompletionRequest,
             top_k=request.top_k,
             ignore_eos=request.ignore_eos,
             use_beam_search=request.use_beam_search,
-            logits_processors=logit_processors,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
@@ -436,7 +435,6 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             max_tokens=request.max_tokens,
             logprobs=request.logprobs,
             use_beam_search=request.use_beam_search,
-            logits_processors=logit_processors,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
